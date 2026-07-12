@@ -245,6 +245,12 @@ pub fn from_like(
         escape_char,
         case_insensitive,
     } = like;
+    let (_, output_field) = Expr::Like(like.clone()).to_field(schema)?;
+    let output_type = to_substrait_type(
+        producer,
+        output_field.data_type(),
+        output_field.is_nullable(),
+    )?;
     make_substrait_like_expr(
         producer,
         *case_insensitive,
@@ -253,9 +259,11 @@ pub fn from_like(
         pattern,
         *escape_char,
         schema,
+        &output_type,
     )
 }
 
+#[expect(clippy::too_many_arguments)]
 fn make_substrait_like_expr(
     producer: &mut impl SubstraitProducer,
     ignore_case: bool,
@@ -264,6 +272,7 @@ fn make_substrait_like_expr(
     pattern: &Expr,
     escape_char: Option<char>,
     schema: &DFSchemaRef,
+    output_type: &Type,
 ) -> datafusion::common::Result<Expression> {
     let function_anchor = if ignore_case {
         producer.register_function("ilike".to_string())
@@ -293,7 +302,7 @@ fn make_substrait_like_expr(
         rex_type: Some(RexType::ScalarFunction(ScalarFunction {
             function_reference: function_anchor,
             arguments,
-            output_type: None,
+            output_type: Some(output_type.clone()),
             args: vec![],
             options: vec![],
         })),
@@ -309,7 +318,7 @@ fn make_substrait_like_expr(
                 arguments: vec![FunctionArgument {
                     arg_type: Some(ArgType::Value(substrait_like)),
                 }],
-                output_type: None,
+                output_type: Some(output_type.clone()),
                 args: vec![],
                 options: vec![],
             })),
@@ -478,5 +487,43 @@ mod tests {
         } else {
             panic!("Substrait ScalarFunction expected")
         }
+    }
+
+    // Regression test: the hand-built LIKE/ILIKE scalar function (and its
+    // negated `not(...)` wrapper) must carry a boolean `output_type`. The
+    // general scalar fix (#20597) did not touch this manual builder.
+    #[tokio::test]
+    async fn like_output_type() -> datafusion::common::Result<()> {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::logical_expr::{Expr, Like, col};
+        use std::sync::Arc;
+        use substrait::proto::r#type::Kind;
+
+        let state = SessionStateBuilder::default().build();
+        let schema: DFSchemaRef = Arc::new(
+            Schema::new(vec![Field::new("s", DataType::Utf8, true)]).try_into()?,
+        );
+        let mut producer = DefaultSubstraitProducer::new(&state);
+
+        for negated in [false, true] {
+            let like = Expr::Like(Like::new(
+                negated,
+                Box::new(col("s")),
+                Box::new(lit("a%")),
+                None,
+                false,
+            ));
+            let substrait_expr = producer.handle_expr(&like, &schema)?;
+            let Expression {
+                rex_type:
+                    Some(RexType::ScalarFunction(ScalarFunction { output_type, .. })),
+            } = substrait_expr
+            else {
+                panic!("Substrait ScalarFunction expected");
+            };
+            let output_type = output_type.expect("LIKE output_type should be set");
+            assert!(matches!(output_type.kind, Some(Kind::Bool(_))));
+        }
+        Ok(())
     }
 }
